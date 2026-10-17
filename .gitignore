@@ -1,0 +1,11 @@
+build/
+__pycache__/
+*.pyc
+.DS_Store
+*.vpk
+# game files are never committed
+*.so
+*.apk
+*.apkm
+*.xapk
+res/
