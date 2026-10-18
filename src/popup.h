@@ -12,6 +12,7 @@ void popup_request(void);   /* ask for it to open (safe to call from inside the 
 int popup_frame_start(void); /* call once per frame before the game: opens it if asked, handles
                                 its input; returns 1 while it is showing (skip the game's input) */
 void popup_draw(void);       /* call after the game has drawn the frame, before swapping */
+int popup_is_open(void);     /* 1 while it is on screen */
 
 /* The credit line ("PS Vita port by rodi - v1.0", app0:credit.png) along the bottom
  * of the start-up loading screen; it fades out when the game has finished loading. */

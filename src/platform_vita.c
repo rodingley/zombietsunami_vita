@@ -94,7 +94,7 @@ void so_log(const char *fmt, ...) {
       strncmp(fmt, "[popup]", 7) != 0 && strncmp(fmt, "[art]", 5) != 0 && strncmp(fmt, "===", 3) != 0 &&
       strncmp(fmt, "[input]", 7) != 0 && strncmp(fmt, "[load]", 6) != 0 && strncmp(fmt, "[shop]", 6) != 0 &&
       strncmp(fmt, "[daily]", 7) != 0 && strncmp(fmt, "[state]", 7) != 0 &&
-      strncmp(fmt, "[promo]", 7) != 0)
+      strncmp(fmt, "[promo]", 7) != 0 && strncmp(fmt, "[update]", 8) != 0)
     return;
   char buf[512];
   va_list ap;

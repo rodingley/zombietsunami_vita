@@ -515,6 +515,8 @@ static void close_popup(void) {}
 void popup_draw(void) {}
 #endif
 
+int popup_is_open(void) { return showing; }
+
 int popup_frame_start(void) {
   SceTouchData td;
   memset(&td, 0, sizeof(td));

@@ -71,6 +71,8 @@ add_executable(zombietsunami_loader.elf
   src/fmod_log.c
   src/patches.c
   src/popup.c
+  src/updater.c
+  src/update_util.c
   src/game_art.c
   src/png_load.c
   src/stage2b.c
@@ -89,6 +91,16 @@ set(VITA_LIBS
   SceCtrl_stub
   SceTouch_stub SceMotion_stub
   ScePower_stub
+  # auto-updater (updater.c): network, HTTPS, pop-ups, restart
+  SceNet_stub
+  SceNetCtl_stub
+  SceHttp_stub
+  SceSsl_stub
+  SceSysmodule_stub
+  SceAppMgr_stub
+  SceAppUtil_stub
+  SceCommonDialog_stub
+  SceProcessmgr_stub
 )
 if(REAL_GL)
   add_definitions(-DREAL_GL=1)

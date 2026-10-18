@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 .DS_Store
 *.vpk
+# ...except each release's VPK, which the auto-updater downloads (src/updater.c)
+!release/zombietsunami.vpk
 # game files are never committed
 *.so
 *.apk

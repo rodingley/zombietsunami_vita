@@ -22,6 +22,7 @@
 #include "popup.h"
 #include "assets.h"
 #include "ime.h"
+#include "updater.h"
 #include "so_platform.h"
 #include "stage1.h"
 
@@ -226,8 +227,10 @@ void stage2b_run(void) {
       }
       /* the Vita keyboard / message for the promo code box (ime.c) */
       ime_frame(env);
+      /* the auto-updater: checks GitHub once in the menus, its pop-ups (updater.c) */
+      updater_frame();
       /* while the "report bugs" pop-up or a system dialog is showing, the game gets no input */
-      if (!popup_frame_start() && !ime_busy()) {
+      if (!popup_frame_start() && !ime_busy() && !updater_busy()) {
         int in = input_poll(send_touch, &tc);
         if ((in & 2) && back_fn)
           back_fn(env, activity_cls);

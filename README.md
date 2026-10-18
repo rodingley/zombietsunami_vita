@@ -44,6 +44,13 @@ the 64-bit files (`arm64-v8a`) and will not work; you need a full bundle of
 In the game's **Market**, open the **Redeem code** box: `RODI` gives 100,000 diamonds,
 `VITA` gives 100,000 coins. Any letter case, usable any number of times.
 
+### Updates
+
+When the game starts and the Vita is on Wi-Fi, it checks this repository for a
+newer release. If there is one, a Vita pop-up asks whether to install it; the
+game then downloads it, installs it and restarts. Saves are kept. Without Wi-Fi
+nothing happens.
+
 ## Building from source
 
 You need [VitaSDK](https://vitasdk.org) (`nightly-softfp` channel) with these
@@ -67,6 +74,17 @@ graphics (for debugging start-up only).
 `tools/extract_libs.sh` and `tools/extract_assets.sh` pull the needed files
 out of an APKMirror `.apkm` bundle of the game.
 
+### Publishing a new version
+
+1. Raise `PORT_VERSION` in `src/config.h` (and `VITA_VERSION` in `CMakeLists.txt`).
+2. Build, then copy `build/zombietsunami.vpk` to `release/zombietsunami.vpk`.
+3. Commit, tag it (`v1.1`, ...) and publish a GitHub release with that tag and
+   the release zip.
+
+The auto-updater reads the latest release's tag and downloads
+`release/zombietsunami.vpk` at that tag through api.github.com (the Vita cannot
+make secure connections to GitHub's release file servers).
+
 ## How it works
 
 | File | What it does |
@@ -79,6 +97,7 @@ out of an APKMirror `.apkm` bundle of the game.
 | `src/assets.c`, `src/asset_io.c`, `src/asset_cache.c` | The game's files read from the memory card, with caching |
 | `src/patches.c` | Small fixes to the game's code (social buttons, Facebook pop-up, loading counter...) |
 | `src/ime.c` | The Vita keyboard for the promo code box, and the port's promo codes |
+| `src/updater.c`, `src/update_util.c`, `src/update_certs.h` | The auto-updater: checks GitHub, asks, downloads and installs a new version |
 | `src/popup.c`, `src/game_art.c`, `src/art_patch.c` | The "report a bug" button and pop-up, built at runtime from the game's own sprite sheets |
 
 The report-bug pop-up and the menu's warning-sign button are cut out of the

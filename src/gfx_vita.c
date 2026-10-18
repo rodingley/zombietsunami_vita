@@ -50,8 +50,9 @@ int gfx_init(int w, int h) {
 }
 
 #include "ime.h"
+#include "updater.h"
 /* while a system dialog (the Vita keyboard) is up it is drawn over the frame */
-void gfx_swap(void) { vglSwapBuffers(ime_busy() ? GL_TRUE : GL_FALSE); }
+void gfx_swap(void) { vglSwapBuffers(ime_busy() || updater_busy() ? GL_TRUE : GL_FALSE); }
 
 void gfx_log_errors(int frame) {
   GLenum e = glGetError();
@@ -113,6 +114,10 @@ void input_ignore_until_released(void) {
   prev_buttons = pad.buttons; /* a button still held is not a new press */
 }
 
+/* 1 while a run is being played (not in a menu): used by the auto-updater, which
+ * only asks in the menus */
+volatile int g_in_run;
+
 int input_poll(touch_fn touch, void *ctx) {
   int result = 0;
   saved_touch = touch;
@@ -145,6 +150,7 @@ int input_poll(touch_fn touch, void *ctx) {
   hb_hist[hb_pos] = hb_now;
   hb_pos = (hb_pos + 1) % 20;
   int in_run = g_in_game && !menu_on_screen;
+  g_in_run = in_run;
   static int last_in_run = -1;
   if (in_run != last_in_run) { /* rare: logged so the log shows how the controls saw the game */
     if (last_in_run >= 0)
