@@ -13,6 +13,17 @@ int upd_version_newer(const char *tag, const char *ours);
 /* the string value of "key" in a JSON text (first one found); 0 = found */
 int upd_json_string(const char *json, const char *key, char *out, int outlen);
 
+/* like upd_json_string, but a long value is cut to fit instead of failing, and
+ * \r, \n, \t and \uXXXX escapes are turned into text (UTF-8); 0 = found */
+int upd_json_text(const char *json, const char *key, char *out, int outlen);
+
+/* the "What's new" list of a release description (markdown): the bullet lines
+ * ("- ..." or "* ...") under a heading or line containing "What's new" (any
+ * case, with or without the apostrophe), cleaned of markdown and turned into
+ * "- item" lines, at most max_items of them, cut to fit outlen.
+ * 0 = found (out holds the list); -1 = no such list (out is empty) */
+int upd_whats_new(const char *body, char *out, int outlen, int max_items);
+
 /* the number value of "key" in a JSON text (first one found); 0 = found */
 int upd_json_number(const char *json, const char *key, long *out);
 
@@ -33,5 +44,16 @@ int upd_zip_each(const uint8_t *zip, uint32_t len, upd_zip_fn fn, void *ctx);
 int upd_zip_find(const uint8_t *zip, uint32_t len, const char *suffix, int exact, uint8_t **out, uint32_t *outlen);
 /* number of files in the zip, -1 if broken */
 int upd_zip_count(const uint8_t *zip, uint32_t len);
+
+/* SHA-1 of data */
+void upd_sha1(const uint8_t *data, uint32_t len, uint8_t out[20]);
+
+/* head.bin: the package header the Vita's installer needs (VitaShell makes one
+ * when it installs a VPK).  Turns a head.bin (the installed game's) into the
+ * one for title_id (9 characters): content ID "EP9000-<title_id>_00-0000000000000000"
+ * (the installer registers the app under that ID) and the header's checksums
+ * made again.  *was_ok = 1 if the checksums of the original were right (so they
+ * are computed the right way).  0 = done, -1 = not a head.bin */
+int upd_head_make(uint8_t *head, uint32_t len, const char *title_id, int *was_ok);
 
 #endif

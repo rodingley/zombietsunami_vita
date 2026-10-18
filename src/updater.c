@@ -11,13 +11,13 @@
  * own servers but not to the servers that hold release files
  * (*.githubusercontent.com), tested on a real Vita.
  *
- * Installing: the VPK is unpacked in memory and checked (it must contain
- * eboot.bin and be this app: TITLE_ID in sce_sys/param.sfo).  Every file is
- * first written next to the installed one as "<name>.upd" in
- * ux0:app/<PORT_TITLE_ID>/; only when all of them were written are they
- * swapped in (eboot.bin last), so a failed download or a full memory card
- * leaves the installed game as it was.  Then the game restarts itself.  The
- * game's data and saves (ux0:data/zombietsunami) are not touched.
+ * Installing: the VPK is checked (it must contain eboot.bin and be this
+ * app: TITLE_ID in sce_sys/param.sfo) and unpacked; then the game starts a
+ * small helper app that installs it with the Vita's own package installer,
+ * the way VitaShell installs a VPK, and starts the game again (see install()
+ * and updater_helper.c).  A failed download or a full memory card leaves the
+ * installed game as it was.  The game's data and saves
+ * (ux0:data/zombietsunami) are not touched.
  *
  * Downloads go over HTTPS with the Vita checking GitHub's certificate, and
  * only from this repository.  The Vita's own list
@@ -25,6 +25,7 @@
  * current root certificates are handed to it first (update_certs.h).  "[update]"
  * lines in log.txt say what happened. */
 
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +34,7 @@
 #include <psp2/apputil.h>
 #include <psp2/appmgr.h>
 #include <psp2/common_dialog.h>
+#include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
@@ -47,6 +49,7 @@
 #include "config.h"
 #include "so_platform.h"
 #include "update_certs.h"
+#include "update_promoter.h"
 #include "update_util.h"
 #include "updater.h"
 
@@ -56,6 +59,8 @@
 #define UPD_DIR DATA_PATH "/update"
 #define UPD_FILE UPD_DIR "/download.tmp"
 #define APP_DIR "ux0:app/" PORT_TITLE_ID
+#define NOTE_FILE DATA_PATH "/update_log.txt"      /* the updater's own log: kept across restarts */
+#define MARK_FILE DATA_PATH "/update_installed.txt" /* the tag of the update just installed */
 
 #define NET_POOL (1024 * 1024)
 #define SSL_POOL (300 * 1024)
@@ -82,6 +87,12 @@ enum {
 
 static volatile int state = ST_WAIT;
 static char new_tag[40];
+static char news[240];     /* the release's "What's new" list, for the pop-up */
+static char mark_tag[40];  /* MARK_FILE: an update installed on an earlier start... */
+static int mark_skip;      /* ...that did not take effect, and the player was told */
+static int tell_failed;    /* ST_FOUND: tell the player the earlier update did not take effect */
+static int asked;         /* the question was shown again after closing by itself */
+static int style;         /* which way of writing the question (0 = with the list, 1 = list on one line, 2 = no list) */
 static char vpk_url[256];
 static long vpk_size; /* from GitHub, for the progress bar and a size check */
 
@@ -89,6 +100,128 @@ static long vpk_size; /* from GitHub, for the progress bar and a size check */
 static volatile int work_pct, work_phase, work_done, work_ok;
 static int shown_pct = -1, shown_phase = -1;
 static char work_error[160];
+
+/* ---- the updater's own log (update_log.txt, kept across restarts) ---- */
+
+static void note(const char *fmt, ...) {
+  char buf[1200];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  so_log("[update] %s", buf);
+  SceUID fd = sceIoOpen(NOTE_FILE, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+  if (fd < 0)
+    return;
+  if (sceIoLseek(fd, 0, SCE_SEEK_END) > 64 * 1024) { /* keep it small */
+    sceIoClose(fd);
+    fd = sceIoOpen(NOTE_FILE, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (fd < 0)
+      return;
+  }
+  sceIoWrite(fd, buf, (SceSize)strlen(buf));
+  sceIoWrite(fd, "\n", 1);
+  sceIoClose(fd);
+}
+
+static long file_size(const char *path) {
+  SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+  if (fd < 0)
+    return -1;
+  long n = (long)sceIoLseek(fd, 0, SCE_SEEK_END);
+  sceIoClose(fd);
+  return n;
+}
+
+/* MARK_FILE holds "<tag>" after an update was installed, "<tag> skip" once the
+ * player was told that it did not take effect (so it is not offered again) */
+static void read_mark(void) {
+  mark_tag[0] = 0;
+  mark_skip = 0;
+  SceUID fd = sceIoOpen(MARK_FILE, SCE_O_RDONLY, 0);
+  if (fd < 0)
+    return;
+  char buf[64];
+  int n = sceIoRead(fd, buf, sizeof(buf) - 1);
+  sceIoClose(fd);
+  if (n <= 0)
+    return;
+  buf[n] = 0;
+  int i = 0;
+  while (i < (int)sizeof(mark_tag) - 1 && buf[i] && buf[i] != ' ' && buf[i] != '\n')
+    mark_tag[i] = buf[i], i++;
+  mark_tag[i] = 0;
+  mark_skip = strstr(buf, "skip") != NULL;
+}
+
+static void write_mark(const char *tag, int skip) {
+  char buf[64];
+  snprintf(buf, sizeof(buf), "%s%s\n", tag, skip ? " skip" : "");
+  SceUID fd = sceIoOpen(MARK_FILE, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+  if (fd >= 0) {
+    sceIoWrite(fd, buf, (SceSize)strlen(buf));
+    sceIoClose(fd);
+  }
+}
+
+static uint8_t *read_file(const char *path, uint32_t *len);
+
+/* after an update: what the helper app said, and remove it and the files */
+static void remove_tree(const char *path);
+static void clean_up(void) {
+  char buf[16] = "";
+  SceUID fd = sceIoOpen(UPD_RESULT_FILE, SCE_O_RDONLY, 0);
+  if (fd >= 0) {
+    int n = sceIoRead(fd, buf, sizeof(buf) - 1);
+    sceIoClose(fd);
+    buf[n > 0 ? n : 0] = 0;
+    if (n > 0 && buf[n - 1] == '\n')
+      buf[n - 1] = 0;
+    sceIoRemove(UPD_RESULT_FILE);
+    note("the update helper answered %s", buf);
+  }
+  remove_tree(UPD_PKG_DIR);
+  remove_tree(UPD_HELPER_DIR);
+  /* the helper app stays open in the background after starting the game:
+   * close it first, then remove it (as VitaShell does with its updater) */
+  sceAppMgrDestroyOtherApp();
+  int r = upd_promoter_start();
+  if (r >= 0) {
+    r = scePromoterUtilityDeletePkg(UPD_HELPER_ID);
+    upd_promoter_stop();
+  }
+  note("removing the update helper app: %08x", (unsigned)r);
+}
+
+/* Copies installed from a VPK made before the content ID was set were
+ * registered by the Vita as "ABCD99999" (the SDK's placeholder) in
+ * ux0:app/ABCD99999.  Once this copy runs under its own ID, that old copy (a
+ * second bubble) is removed -- only if it really is this game. */
+#define OLD_ID "ABCD99999"
+static void remove_old_copy(void) {
+  uint32_t l = 0, hl = 0;
+  uint8_t *sfo = read_file("ux0:app/" OLD_ID "/sce_sys/param.sfo", &l);
+  if (!sfo)
+    return;
+  char tid[16] = "";
+  upd_sfo_string(sfo, l, "TITLE_ID", tid, sizeof(tid));
+  free(sfo);
+  /* and this copy is not that one (its package header names this game's ID) */
+  uint8_t *head = read_file("app0:" UPD_HEAD_BIN, &hl);
+  int ours = 0;
+  for (uint32_t i = 0x30; head && hl > 0x60 && i + 9 <= 0x60; i++)
+    if (!memcmp(head + i, PORT_TITLE_ID, 9))
+      ours = 1;
+  free(head);
+  if (strcmp(tid, PORT_TITLE_ID) != 0 || !ours)
+    return;
+  int r = upd_promoter_start();
+  if (r >= 0) {
+    r = scePromoterUtilityDeletePkg(OLD_ID);
+    upd_promoter_stop();
+  }
+  note("removed the old copy of the game (" OLD_ID "): %08x", (unsigned)r);
+}
 
 /* ---- networking ---- */
 
@@ -366,6 +499,19 @@ static int check_thread(SceSize args, void *argp) {
   (void)args;
   (void)argp;
   int found = 0;
+  note("start: this is v%s", PORT_VERSION);
+  remove_old_copy();
+  /* did an update installed on an earlier start take effect? */
+  read_mark();
+  if (mark_tag[0] && !mark_skip)
+    clean_up(); /* the first start after an update: remove the helper app */
+  if (mark_tag[0] && !upd_version_newer(mark_tag, PORT_VERSION)) {
+    note("the update to %s worked: this is now v%s", mark_tag, PORT_VERSION);
+    sceIoRemove(MARK_FILE);
+    mark_tag[0] = 0;
+  } else if (mark_tag[0]) {
+    note("the update to %s was installed earlier, but this is still v%s", mark_tag, PORT_VERSION);
+  }
   if (net_start() == 0) {
     char *json = NULL;
     if (http_get_text(API_URL, "application/vnd.github+json", &json) > 0) {
@@ -376,18 +522,25 @@ static int check_thread(SceSize args, void *argp) {
       } else if (!upd_tag_ok(new_tag)) {
         so_log("[update] the latest release has an unusual tag: ignored");
       } else {
-        /* is the release's VPK in the repository at that tag? (and how big) */
-        char *meta = NULL;
+        /* its VPK, in the repository at that tag (its size comes with the download) */
         snprintf(vpk_url, sizeof(vpk_url), VPK_URL_FMT, new_tag);
         vpk_size = 0;
-        if (http_get_text(vpk_url, "application/vnd.github+json", &meta) > 0 &&
-            upd_json_number(meta, "size", &vpk_size) == 0 && vpk_size > 1024 && vpk_size <= MAX_DOWNLOAD) {
-          so_log("[update] release %s is newer than v%s (VPK %ld bytes)", new_tag, PORT_VERSION, vpk_size);
-          found = 1;
-        } else {
-          so_log("[update] release %s has no " UPDATE_VPK_PATH " in the repository", new_tag);
+        note("release %s is newer than v%s", new_tag, PORT_VERSION);
+        found = 1;
+        /* its "What's new" list, for the pop-up */
+        static char body[4096];
+        news[0] = 0;
+        if (upd_json_text(json, "body", body, sizeof(body)) == 0)
+          upd_whats_new(body, news, sizeof(news), 5);
+        /* the same update was installed before and did not take effect: do not loop */
+        if (mark_tag[0] && !strcmp(mark_tag, new_tag)) {
+          if (mark_skip) {
+            note("not offering %s again: installing it did not take effect before", new_tag);
+            found = 0;
+          } else {
+            tell_failed = 1;
+          }
         }
-        free(meta);
       }
     }
     free(json);
@@ -402,7 +555,7 @@ static int check_thread(SceSize args, void *argp) {
 
 static void fail(const char *why) {
   snprintf(work_error, sizeof(work_error), "%s", why);
-  so_log("[update] %s", why);
+  note("%s", why);
 }
 
 static int download(const char *url, const char *path) {
@@ -466,68 +619,65 @@ static int download(const char *url, const char *path) {
   return 0;
 }
 
+/* Installing goes through the Vita's own package installer (the "promoter",
+ * the same one VitaShell uses for a VPK): files written straight into
+ * ux0:app/<TITLE_ID> are not what the Vita starts (tested), and a running app
+ * cannot install a new version of itself.  So the new version is unpacked
+ * into UPD_PKG_DIR, a tiny second app (updater_helper.c, shipped in the VPK as
+ * app0:updater/) is installed, and after the game closes that app installs the
+ * update and starts the game again.  The installer needs a package header
+ * (head.bin) for each app: VitaShell made one for the game when it was
+ * installed; it only depends on the TITLE_ID, so it is used again, and turned
+ * into the helper's one (update_util.c). */
+#define HEAD_BIN UPD_HEAD_BIN
+
+static void remove_tree(const char *path) {
+  SceUID d = sceIoDopen(path);
+  if (d < 0) {
+    sceIoRemove(path);
+    return;
+  }
+  SceIoDirent e;
+  memset(&e, 0, sizeof(e));
+  while (sceIoDread(d, &e) > 0) {
+    char sub[512];
+    snprintf(sub, sizeof(sub), "%s/%s", path, e.d_name);
+    if (SCE_S_ISDIR(e.d_stat.st_mode))
+      remove_tree(sub);
+    else
+      sceIoRemove(sub);
+    memset(&e, 0, sizeof(e));
+  }
+  sceIoDclose(d);
+  sceIoRmdir(path);
+}
+
 typedef struct {
   int written, total;
   int failed;
-} stage_ctx;
+} unpack_ctx;
 
-/* phase 1: every file written as <name>.upd next to the installed one */
-static int stage_one(void *ctx, const char *name, const uint8_t *data, uint32_t len) {
-  stage_ctx *c = ctx;
+static int count_one(void *ctx, const char *name, const uint8_t *data, uint32_t len) {
+  (void)name;
+  (void)data;
+  (void)len;
+  ((unpack_ctx *)ctx)->total++;
+  return 0;
+}
+
+/* every file of the VPK into UPD_PKG_DIR */
+static int unpack_one(void *ctx, const char *name, const uint8_t *data, uint32_t len) {
+  unpack_ctx *c = ctx;
   char path[512];
-  snprintf(path, sizeof(path), APP_DIR "/%s.upd", name);
+  snprintf(path, sizeof(path), UPD_PKG_DIR "/%s", name);
   if (write_file(path, data, len)) {
-    so_log("[update] could not write %s", path);
+    note("could not write %s", path);
     c->failed = 1;
     return 1;
   }
   c->written++;
-  work_pct = 85 + (c->total ? c->written * 10 / c->total : 0);
+  work_pct = 84 + (c->total ? c->written * 8 / c->total : 0);
   sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND);
-  return 0;
-}
-
-/* the names, for the swap and the clean-up */
-typedef struct {
-  char names[64][160];
-  int n;
-} name_list;
-
-static int collect_name(void *ctx, const char *name, const uint8_t *data, uint32_t len) {
-  (void)data;
-  (void)len;
-  name_list *l = ctx;
-  if (l->n >= 64 || strlen(name) >= sizeof(l->names[0]))
-    return 1;
-  strcpy(l->names[l->n++], name);
-  return 0;
-}
-
-static void remove_staged(const name_list *l) {
-  char path[512];
-  for (int i = 0; i < l->n; i++) {
-    snprintf(path, sizeof(path), APP_DIR "/%s.upd", l->names[i]);
-    sceIoRemove(path);
-  }
-}
-
-/* phase 2: <name>.upd -> <name>; eboot.bin last */
-static int swap_in(const name_list *l) {
-  char from[512], to[512];
-  for (int pass = 0; pass < 2; pass++)
-    for (int i = 0; i < l->n; i++) {
-      int is_eboot = !strcmp(l->names[i], "eboot.bin");
-      if (is_eboot != (pass == 1))
-        continue;
-      snprintf(from, sizeof(from), APP_DIR "/%s.upd", l->names[i]);
-      snprintf(to, sizeof(to), APP_DIR "/%s", l->names[i]);
-      sceIoRemove(to);
-      int r = sceIoRename(from, to);
-      if (r < 0) {
-        so_log("[update] could not put %s in place (%08x)", to, (unsigned)r);
-        return -1;
-      }
-    }
   return 0;
 }
 
@@ -550,24 +700,73 @@ static int install(const uint8_t *vpk, uint32_t vlen) {
   }
   free(eboot);
 
-  static name_list names;
-  memset(&names, 0, sizeof(names));
-  if (upd_zip_each(vpk, vlen, collect_name, &names) != 0) {
-    fail("The downloaded update is damaged.");
+  /* the head.bin made when the game was installed, and the helper app */
+  uint32_t hl = 0, hel = 0, hsl = 0;
+  uint8_t *head = read_file("app0:" HEAD_BIN, &hl);
+  uint8_t *helper_head = NULL;
+  uint8_t *helper_eboot = read_file("app0:updater/eboot.bin", &hel);
+  uint8_t *helper_sfo = read_file("app0:updater/param.sfo", &hsl);
+  int sums_ok = 0;
+  if (head && (helper_head = malloc(hl)) != NULL) {
+    /* both made for the right title ID: a copy installed by VitaShell from an
+     * older VPK has the SDK's placeholder ID (HB0001-ABCD99999) in it, and the
+     * Vita registers the app under that ID, so it cannot be found as the game */
+    memcpy(helper_head, head, hl);
+    if (upd_head_make(head, hl, PORT_TITLE_ID, &sums_ok) || upd_head_make(helper_head, hl, UPD_HELPER_ID, NULL)) {
+      free(helper_head);
+      helper_head = NULL;
+    }
+  }
+  note("head.bin %u bytes (checksums %s), helper %u + %u bytes", head ? (unsigned)hl : 0u,
+       helper_head ? (sums_ok ? "as expected" : "NOT as expected") : "unreadable", (unsigned)hel, (unsigned)hsl);
+  if (!head || !helper_head || !helper_eboot || !helper_sfo) {
+    free(head);
+    free(helper_head);
+    free(helper_eboot);
+    free(helper_sfo);
+    fail("This copy of the game cannot install updates by itself. Please install the update with VitaShell.");
     return -1;
   }
-  stage_ctx sc = {0, names.n, 0};
-  if (upd_zip_each(vpk, vlen, stage_one, &sc) != 0) {
-    remove_staged(&names);
-    fail(sc.failed ? "The update could not be written (is the memory card full?)." : "The downloaded update is damaged.");
+
+  /* the new version, unpacked */
+  remove_tree(UPD_PKG_DIR);
+  remove_tree(UPD_HELPER_DIR);
+  unpack_ctx uc = {0, 0, 0};
+  upd_zip_each(vpk, vlen, count_one, &uc);
+  int bad = upd_zip_each(vpk, vlen, unpack_one, &uc) != 0;
+  bad = bad || write_file(UPD_PKG_DIR "/" HEAD_BIN, head, hl);
+  /* the helper app's package */
+  bad = bad || write_file(UPD_HELPER_DIR "/eboot.bin", helper_eboot, hel) ||
+        write_file(UPD_HELPER_DIR "/sce_sys/param.sfo", helper_sfo, hsl) ||
+        write_file(UPD_HELPER_DIR "/" HEAD_BIN, helper_head, hl);
+  free(head);
+  free(helper_head);
+  free(helper_eboot);
+  free(helper_sfo);
+  if (bad) {
+    remove_tree(UPD_PKG_DIR);
+    remove_tree(UPD_HELPER_DIR);
+    fail(uc.failed ? "The update could not be written (is the memory card full?)." : "The downloaded update is damaged.");
     return -1;
   }
-  if (swap_in(&names)) {
-    remove_staged(&names);
-    fail("The update could not be installed.");
+  note("unpacked %d files into " UPD_PKG_DIR, uc.written);
+  work_pct = 94;
+
+  /* install the helper app */
+  int r = upd_promoter_start();
+  if (r >= 0) {
+    r = scePromoterUtilityPromotePkgWithRif(UPD_HELPER_DIR, 1);
+    upd_promoter_stop();
+  }
+  note("installing the update helper: %08x", (unsigned)r);
+  if (r < 0) {
+    remove_tree(UPD_PKG_DIR);
+    remove_tree(UPD_HELPER_DIR);
+    snprintf(work_error, sizeof(work_error), "The update could not be installed (error %08X). Please install it with VitaShell.",
+             (unsigned)r);
+    note("%s", work_error);
     return -1;
   }
-  so_log("[update] installed %d files into " APP_DIR, names.n);
   return 0;
 }
 
@@ -587,6 +786,8 @@ static int work_thread(SceSize args, void *argp) {
       work_pct = 85;
       ok = install(vpk, vlen) == 0;
       free(vpk);
+      if (ok)
+        write_mark(new_tag, 0); /* the next start checks that it took effect */
     }
     sceIoRemove(UPD_FILE);
   }
@@ -652,11 +853,13 @@ static int show_progress(const char *text) {
   return r;
 }
 
-static void restart_game(void) {
-  so_log("[update] restarting");
+/* the update is unpacked and the helper app installed: start it (it installs
+ * the update and starts the game again) and close */
+static void start_helper(void) {
+  note("starting the update helper");
   so_log_flush();
-  sceAppMgrLoadExec("app0:eboot.bin", NULL, NULL);
-  /* only gets here if the restart did not work: close, the player starts it again */
+  /* as VitaShell starts its updater app */
+  sceAppMgrLaunchAppByUri(0xFFFFF, "psgm:play?titleid=" UPD_HELPER_ID);
   sceKernelExitProcess(0);
 }
 
@@ -681,12 +884,60 @@ void updater_frame(void) {
      * of a run or over another pop-up */
     if (g_in_run || ime_busy() || popup_is_open())
       return;
-    char text[400];
-    snprintf(text, sizeof(text),
-             "A new version of Zombie Tsunami Vita is available!\n\n"
-             "You have v%s. The new version is %s.\n\n"
-             "Download and install it now?\nThe game restarts when it is done. Your progress is kept.",
-             PORT_VERSION, new_tag);
+    char text[SCE_MSG_DIALOG_USER_MSG_SIZE];
+    if (tell_failed) {
+      /* installed on an earlier start, but this is still the old version */
+      net_stop();
+      snprintf(text, sizeof(text),
+               "The update to %s did not take effect.\n\n"
+               "Please install it with VitaShell:\ngithub.com/" UPDATE_REPO,
+               new_tag);
+      write_mark(new_tag, 1); /* told once: not offered again */
+      if (show_message(SCE_MSG_DIALOG_BUTTON_TYPE_OK, text) < 0) {
+        state = ST_DONE;
+        return;
+      }
+      work_ok = 0;
+      state = ST_RESULT;
+      return;
+    }
+    /* the Vita refuses some messages (error 80100A01, the pop-up never shows):
+     * if it does, the question is asked again written more simply */
+    if (!news[0] && style < 2)
+      style = 2;
+    if (style == 0) {
+      snprintf(text, sizeof(text),
+               "Zombie Tsunami Vita %s is available! (You have v%s.)\n\n"
+               "What's new:\n%s\n\n"
+               "Install it now? Your progress is kept.",
+               new_tag, PORT_VERSION, news);
+    } else if (style == 1) {
+      /* the list on one line: "a, b, c." */
+      char line[sizeof(news)];
+      int n = 0;
+      for (const char *p = news; *p && n < (int)sizeof(line) - 3;) {
+        if (p[0] == '-' && p[1] == ' ')
+          p += 2;
+        while (*p && *p != '\n' && n < (int)sizeof(line) - 3)
+          line[n++] = *p++;
+        if (*p == '\n') {
+          p++;
+          if (*p)
+            line[n++] = ',', line[n++] = ' ';
+        }
+      }
+      line[n] = 0;
+      snprintf(text, sizeof(text),
+               "Zombie Tsunami Vita %s is available! (You have v%s.)\n\n"
+               "What's new: %s.\n\n"
+               "Install it now? Your progress is kept.",
+               new_tag, PORT_VERSION, line);
+    } else {
+      snprintf(text, sizeof(text),
+               "Zombie Tsunami Vita %s is available! (You have v%s.)\n\n"
+               "Install it now? Your progress is kept.",
+               new_tag, PORT_VERSION);
+    }
     if (show_message(SCE_MSG_DIALOG_BUTTON_TYPE_YESNO, text) < 0) {
       net_stop();
       state = ST_DONE;
@@ -703,8 +954,24 @@ void updater_frame(void) {
     memset(&res, 0, sizeof(res));
     sceMsgDialogGetResult(&res);
     sceMsgDialogTerm();
+    if (res.result < 0 && style < 2) {
+      /* the Vita refused the message: write it more simply */
+      note("the Vita refused pop-up style %d (%08x): trying a simpler one", style, (unsigned)res.result);
+      style++;
+      state = ST_FOUND;
+      return;
+    }
+    if (res.buttonId != SCE_MSG_DIALOG_BUTTON_ID_YES && res.buttonId != SCE_MSG_DIALOG_BUTTON_ID_NO && !asked) {
+      /* closed without an answer: ask once more */
+      note("the question closed without an answer (result %d, button %d): asking again", (int)res.result,
+           (int)res.buttonId);
+      asked = 1;
+      state = ST_FOUND;
+      return;
+    }
     if (res.buttonId != SCE_MSG_DIALOG_BUTTON_ID_YES) {
-      so_log("[update] the player chose not to update now");
+      note("the player chose not to update now (pop-up style %d, result %08x, button %d)", style, (unsigned)res.result,
+           (int)res.buttonId);
       net_stop();
       state = ST_DONE;
       return;
@@ -722,6 +989,7 @@ void updater_frame(void) {
       fail("The update could not start.");
       work_done = 1;
     }
+    note("the player chose to update to %s (pop-up style %d)", new_tag, style);
     state = ST_WORKING;
     return;
   }
@@ -735,7 +1003,7 @@ void updater_frame(void) {
       shown_phase = work_phase;
       if (shown_phase == 1)
         sceMsgDialogProgressBarSetMsg(SCE_MSG_DIALOG_PROGRESSBAR_TARGET_BAR_DEFAULT,
-                                      (const SceChar8 *)"Installing the update...");
+                                      (const SceChar8 *)"Installing the update...\nThe game will restart.");
     }
     sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND);
     if (work_done) {
@@ -748,18 +1016,14 @@ void updater_frame(void) {
     if (sceMsgDialogGetStatus() != SCE_COMMON_DIALOG_STATUS_FINISHED)
       return;
     sceMsgDialogTerm();
+    if (work_ok)
+      start_helper(); /* straight on: the progress bar said the game restarts */
     {
       char text[300];
-      if (work_ok)
-        snprintf(text, sizeof(text), "Update installed! (%s)\n\nThe game will now restart.", new_tag);
-      else
-        snprintf(text, sizeof(text),
+      snprintf(text, sizeof(text),
                  "%s\n\nYou can keep playing this version. The game will offer the update again next time.",
                  work_error[0] ? work_error : "The update could not be installed.");
       if (show_message(SCE_MSG_DIALOG_BUTTON_TYPE_OK, text) < 0) {
-        /* no pop-up: do not leave the game waiting for one */
-        if (work_ok)
-          restart_game();
         state = ST_DONE;
         return;
       }
@@ -772,7 +1036,7 @@ void updater_frame(void) {
       return;
     sceMsgDialogTerm();
     if (work_ok)
-      restart_game();
+      start_helper();
     state = ST_DONE;
     return;
 
