@@ -96,7 +96,7 @@ make secure connections to GitHub's release file servers).
 | `src/jni.c` | A fake Java VM: answers every Java call the game makes |
 | `src/gfx_vita.c`, `src/gl_real.c` | Screen through vitaGL; touch, buttons and motion sensors |
 | `src/opensl_vita.c` | Sound (OpenSL ES for FMOD) |
-| `src/assets.c`, `src/asset_io.c`, `src/asset_cache.c` | The game's files read from the memory card, with caching |
+| `src/assets.c`, `src/asset_io.c`, `src/asset_cache.c` | The game's files read from `ux0:` (memory card, SD2Vita or internal storage), with caching |
 | `src/patches.c` | Small fixes to the game's code (social buttons, Facebook pop-up, loading counter...) |
 | `src/ime.c` | The Vita keyboard for the promo code box, and the port's promo codes |
 | `src/updater.c`, `src/update_util.c`, `src/update_certs.h` | The auto-updater: checks GitHub, asks, downloads and prepares a new version |
