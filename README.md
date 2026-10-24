@@ -1,13 +1,8 @@
 # Zombie Tsunami for PS Vita
 
-An unofficial fan port of the Android version of **Zombie Tsunami (4.7.3)** to
-the PS Vita / PS TV. PS Vita port by rodi.
+An unofficial fan port of the Android version of **Zombie Tsunami (4.7.3)** to the PS Vita / PS TV. PS Vita port by rodi.
 
-The port is a loader (an "so-loader"): it loads the game's own Android
-libraries on the Vita and supplies everything they expect from Android
-(Java calls, OpenGL ES, sound, files, touch, the keyboard). **This repository
-and the release downloads contain no game code and no game data** - players
-use the files from their own copy of the game.
+The port is a loader (an "so-loader"): it loads the game's own Android libraries on the Vita and supplies everything they expect from Android (Java calls, OpenGL ES, sound, files, touch, the keyboard). **This repository and the release downloads contain no game code and no game data** - players use the files from their own copy of the game.
 
 ## Download and install
 
